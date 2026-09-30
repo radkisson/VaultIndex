@@ -1,0 +1,7 @@
+{
+  "research":   ["00-inbox", "06-research"],
+  "projects":   ["08-projects"],
+  "archive":    ["99-archive"],
+  "library":    ["07-library"],
+  "journaling": ["10-journaling"]
+}
