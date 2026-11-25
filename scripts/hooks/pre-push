@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# pre-push: never publish a machine path, and never publish a backup ref.
+#
+# Installed by scripts/install-hooks.sh. Bypass is deliberately awkward:
+#   git push --no-verify
+#
+# Git gives this hook one line per ref on stdin:
+#   <local ref> <local sha> <remote ref> <remote sha>
+set -uo pipefail
+
+status=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ -z "${local_ref:-}" ] && continue
+    # Deletions carry an all-zero local sha; nothing to inspect.
+    case "$local_sha" in
+        0000000000000000000000000000000000000000) continue ;;
+    esac
+
+    case "$remote_ref" in
+        *backup*)
+            echo "pre-push: refusing to publish $remote_ref (a backup ref)"
+            status=1
+            continue
+            ;;
+    esac
+
+    # Commits that are not already on the remote, i.e. what this push adds.
+    new_commits=$(git rev-list "$local_sha" --not --remotes=origin 2>/dev/null || true)
+    [ -z "$new_commits" ] && continue
+
+    for sha in $new_commits; do
+        if git show --format= --patch "$sha" 2>/dev/null \
+            | grep -qE "/Volumes/[A-Za-z]|/Users/[A-Za-z]|$(whoami)"; then
+            echo "pre-push: refusing to publish $(git log -1 --format='%h %s' "$sha")"
+            echo "          it contains a machine-local path or username:"
+            git show --format= --patch "$sha" \
+                | grep -nE "/Volumes/[A-Za-z]|/Users/[A-Za-z]|$(whoami)" \
+                | head -3 | sed 's/^/            /'
+            status=1
+        fi
+    done
+done
+
+if [ "$status" -ne 0 ]; then
+    echo "pre-push: blocked. Fix the content, or bypass with --no-verify."
+fi
+exit "$status"

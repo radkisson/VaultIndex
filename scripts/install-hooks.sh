@@ -11,6 +11,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOOKS="$(git -C "$HERE" rev-parse --git-path hooks)"
 
 mkdir -p "$HOOKS"
-cp "$HERE/scripts/hooks/pre-commit" "$HOOKS/pre-commit"
-chmod +x "$HOOKS/pre-commit"
-echo "installed $HOOKS/pre-commit"
+for hook in pre-commit pre-push; do
+    cp "$HERE/scripts/hooks/$hook" "$HOOKS/$hook"
+    chmod +x "$HOOKS/$hook"
+    echo "installed $HOOKS/$hook"
+done

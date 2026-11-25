@@ -64,6 +64,17 @@ before anything else, so no machine paths live in the public repo. Supported key
 the fixture suite and ends with `done`. With no config and no vault in the
 working directory, `vault` explains what to set rather than guessing.
 
+Install the guards, or the checks only run when you remember to run them:
+
+```bash
+scripts/install-hooks.sh
+```
+
+`pre-commit` runs `check.sh` whenever the engine, wrapper, scripts or tests are
+staged. `pre-push` refuses to publish a commit whose diff contains a
+machine-local path or your username, and refuses any ref named like a backup.
+Both are local to a clone; `--no-verify` bypasses them deliberately.
+
 ## 3. Point it at a vault
 
 A vault is any directory of markdown. Conventions live in
