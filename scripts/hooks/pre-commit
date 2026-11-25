@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# pre-commit: refuse a commit that does not pass the acceptance gate.
+#
+#   scripts/install-hooks.sh          # install into .git/hooks
+#   git commit --no-verify            # bypass deliberately
+#
+# Skips the real-vault smoke (no VAULT_PATH) so a commit never depends on a
+# particular vault being mounted.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+if [ -n "${SKIP_VAULT_CHECK:-}" ]; then
+    echo "pre-commit: skipped (SKIP_VAULT_CHECK set)"
+    exit 0
+fi
+
+# Only gate commits that touch the engine or its tests.
+changed=$(git -C "$HERE" diff --cached --name-only --diff-filter=ACMR \
+    | grep -E '^(organize\.py|vault_db\.py|bin/vault|scripts/|tests/)' || true)
+if [ -z "$changed" ]; then
+    exit 0
+fi
+
+echo "pre-commit: checking vault engine"
+VAULT_PATH= "$HERE/scripts/check.sh" || {
+    echo
+    echo "pre-commit: check.sh failed. Fix it, or bypass with --no-verify."
+    exit 1
+}

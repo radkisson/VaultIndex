@@ -61,8 +61,15 @@ EMBED_TIMEOUT = 120.0
 # ── Domain classification by folder prefix ──────────────────────────────────
 
 def _load_domains():
-    """Load domain→prefixes mapping from domains.json, falling back to defaults."""
-    domains_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "domains.json")
+    """Load domain→prefixes mapping, falling back to built-in defaults.
+
+    `DOMAINS_PATH` lets an instance keep its own taxonomy without editing this
+    repo, which is what keeps the engine public and the mapping personal.
+    """
+    domains_path = os.environ.get(
+        "DOMAINS_PATH",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "domains.json"),
+    )
     defaults = {
         "research": ["00-inbox", "06-research"],
         "projects": ["08-projects"],
@@ -249,18 +256,33 @@ def embed_checked(text: str) -> list[float]:
 # ── File discovery & reading ───────────────────────────────────────────────
 
 
-def find_md_files(vault=VAULT) -> list[str]:
-    """Find all .md files, excluding hidden dirs and common noise."""
+def find_text_files(vault=VAULT) -> list[str]:
+    """Every file worth embedding: markdown, plus .txt companions of PDFs.
+
+    A PDF cannot be embedded, but the text extracted beside it can. Indexing the
+    companion is what makes non-markdown sources classifiable by the organizer
+    instead of invisible.
+    """
     skip_prefixes = (".", "assets", "_Archive", "node_modules")
-    md_files = []
+    found = []
     for root, dirs, files in os.walk(vault):
         dirs[:] = [d for d in dirs if not d.startswith(".")]
+        pdf_stems = {
+            os.path.splitext(f)[0].lower() for f in files if f.lower().endswith(".pdf")
+        }
         for f in files:
-            if f.endswith(".md"):
-                rel = os.path.relpath(os.path.join(root, f), vault)
-                if not rel.startswith(skip_prefixes):
-                    md_files.append(rel)
-    return sorted(md_files)
+            lower = f.lower()
+            is_md = lower.endswith(".md")
+            is_companion = (
+                lower.endswith(".txt")
+                and os.path.splitext(f)[0].lower() in pdf_stems
+            )
+            if not (is_md or is_companion):
+                continue
+            rel = os.path.relpath(os.path.join(root, f), vault)
+            if not rel.startswith(skip_prefixes):
+                found.append(rel)
+    return sorted(found)
 
 
 def _strip_frontmatter(content: str) -> str:
@@ -376,6 +398,23 @@ def sql_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _touch_state(table) -> None:
+    """Publish rows/version/model so the organizer's cache can validate itself.
+
+    Best effort: bookkeeping must never break an index run.
+    """
+    try:
+        import organize
+
+        try:
+            dims = int(table.schema.field("vector").type.list_size)
+        except Exception:
+            dims = 0
+        organize.write_state(DB_DIR, int(table.count_rows()), MODEL, dims)
+    except Exception:
+        pass
+
+
 def upsert_notes(table, records: list[dict]):
     """Upsert (insert or update) a batch of notes, keyed on `path`.
 
@@ -392,6 +431,7 @@ def upsert_notes(table, records: list[dict]):
             .when_not_matched_insert_all()
             .execute(records)
         )
+        _touch_state(table)
         return
     except Exception:
         # Missing on older LanceDB, or it rejected this batch's shape. Fall
@@ -408,6 +448,7 @@ def upsert_notes(table, records: list[dict]):
     except Exception:
         pass  # paths may not exist yet — a no-op match is fine for an upsert
     table.add(_records_to_table(records))
+    _touch_state(table)
 
 
 def _records_to_table(records: list[dict]) -> pa.Table:
@@ -590,7 +631,7 @@ def cmd_index(args):
         if args.test <= 0:
             print("index --test requires a positive integer.")
             sys.exit(1)
-        files = find_md_files()
+        files = find_text_files()
         sample = files[: args.test]
         print(f"Vault has {len(files)} .md files total.")
         print(f"Embedding {args.test} sample files with {MODEL}...\n")
@@ -641,14 +682,14 @@ def cmd_index(args):
         print(f"Done. Domain: {record['domain']}  Chars: {record['char_count']}")
 
     elif args.all:
-        files = find_md_files()
+        files = find_text_files()
         print(f"Vault: {len(files)} .md files · model {MODEL} · LanceDB at {DB_DIR}")
         result = index_files(table, files, label="Embedding")
         _index_summary(result)
         cmd_stats(None)
     elif args.missing:
         existing = set(table.to_arrow().column("path").to_pylist())
-        files = [f for f in find_md_files() if f not in existing]
+        files = [f for f in find_text_files() if f not in existing]
         if not files:
             print("Coverage complete — every vault file is already indexed.")
         else:
@@ -658,7 +699,7 @@ def cmd_index(args):
     elif args.reclassify:
         _reclassify(table)
     elif args.prune:
-        disk = set(find_md_files())
+        disk = set(find_text_files())
         db_paths = set(table.to_arrow().column("path").to_pylist())
         ghosts = sorted(db_paths - disk)
         missing = sorted(_classify_missing(disk - db_paths)[0])
@@ -708,10 +749,15 @@ def _reclassify(table) -> int:
 def cmd_sync(args):
     """Reconcile the DB with the filesystem: reclassify stale domains,
     prune ghost rows, and embed files missing from the index."""
+    # Say where we are writing before touching anything: a bare invocation with
+    # no DB_DIR falls back to this repo's sibling directory, and reindexing a
+    # phantom table there while the real index goes stale is invisible otherwise.
+    print(f"index: {DB_DIR}")
+    print(f"vault: {VAULT}")
     db = get_db()
     table = create_table(db)
 
-    disk = set(find_md_files())
+    disk = set(find_text_files())
     indexed = set(table.to_arrow().column("path").to_pylist())
 
     ghosts = sorted(indexed - disk)
@@ -769,6 +815,9 @@ def cmd_sync(args):
         tail = f"{embedded} embedded, {short} too short, {errors} errors"
     if updated:
         tail += f", {updated} content-updated"
+    # Sync can prune and reclassify without any upsert; publish the state anyway
+    # so the organizer's cache never validates against a stale row count.
+    _touch_state(table)
     print(f"\nSync complete: {len(ghosts)} ghosts pruned, {tail}.")
     if getattr(args, "notify", False):
         msg = f"{len(ghosts)} ghosts pruned, {embedded} embedded"
@@ -904,7 +953,7 @@ def cmd_stats(args):
             if stale:
                 print("    Fix: python3 vault_db.py index --reclassify")
 
-            on_disk = set(find_md_files())
+            on_disk = set(find_text_files())
             indexed = {r["path"] for r in rows}
             missing, too_short = _classify_missing(on_disk - indexed)
             ghosts = indexed - on_disk
@@ -956,7 +1005,7 @@ def cmd_doctor(args):
 
     # 2. Vault
     if os.path.isdir(VAULT):
-        files = find_md_files()
+        files = find_text_files()
         ok("vault", f"{len(files):,} markdown files in {VAULT}")
     else:
         files = []
@@ -1100,7 +1149,7 @@ def cmd_topics(args):
     paths_all = arrow.column("path").to_pylist()
     titles_all = arrow.column("title").to_pylist()
 
-    disk_all = find_md_files()
+    disk_all = find_text_files()
     if args.domain:
         idx = [i for i, d in enumerate(domains_all) if d == args.domain]
         if not idx:
@@ -1371,6 +1420,9 @@ def flush_batch(table, pending: dict[str, tuple[str, float]], notify: bool = Fal
                     print(f"  ✗ removed  {rel}")
                 except Exception as e2:
                     print(f"  ! remove failed  {rel}: {e2}")
+        # A delete changes the corpus too: bump the version or the organizer's
+        # cache keeps serving the removed note's vector.
+        _touch_state(table)
 
     # Upserts — one batched write (single delete + add).
     if upsert_records:

@@ -109,6 +109,35 @@ python3 vault_db.py sync
 
 This embeds every `.md` note in the vault (~5,000 notes takes ~10–15 minutes). Subsequent runs only embed what's new or changed.
 
+## The `vault` command
+
+`bin/vault` is the single entry point. It finds this repo from its own location
+(symlinks resolved), resolves the vault from the working directory, and routes
+subcommands to `vault_db.py` or `organize.py`. Bare words become a search.
+
+```bash
+cp bin/vault ~/bin/vault && chmod +x ~/bin/vault   # copy, never symlink
+cd ~/any/vault && vault organize plan 00-inbox --json
+```
+
+Copy rather than symlink: the wrapper finds this repo from its own path either
+way, but a symlink turns any write to `~/bin/vault` into a write to the tracked
+file, and a shim that execs itself looks identical to a working install until it
+hangs. Record machine paths in `~/.config/vault/config` instead.
+
+Everything instance-specific is overridable, so the repo stays generic:
+
+| Variable | Meaning |
+|---|---|
+| `VAULT_TOOLS` | where the venv lives |
+| `VAULTINDEX_HOME` | this checkout (default: the script's parent) |
+| `VAULT_PATH` | the vault to act on (default: resolved from cwd) |
+| `VAULT_DEFAULT` | fallback when the cwd has no vault |
+| `DB_DIR` | index location (default: the vault's `.vaultindex.json`) |
+| `DOMAINS_PATH` | taxonomy file (default: the vault's own, else built-in) |
+
+Exit codes: 0 success, 1 unhealthy or a missing engine/venv, 2 bad usage.
+
 ## Commands
 
 ### `sync` — reconcile index with filesystem
@@ -209,6 +238,73 @@ python3 vault_db.py install-plist             # print plist to stdout for inspec
 ```
 
 All commands accept `--db DIR` to use a different LanceDB directory.
+
+## Organizing: `organize.py`
+
+Classify notes by their nearest neighbours, then plan, apply and undo moves.
+It reads embeddings, never note bodies, and it refuses to invent thresholds.
+
+```bash
+python organize.py calibrate                 # derive gates from this corpus (~10 s)
+python organize.py plan 00-inbox --json      # duplicates, moves, coverage
+python organize.py apply plan.json           # move + relink + reindex
+python organize.py undo apply-20261124T101500
+```
+
+`plan` reports three things per scope: **duplicates** (nearest neighbour inside
+`--dup`), **moves** (modal destination among neighbours outside the note's own
+folder), and **unclassified**. It also reports coverage: indexed notes against
+markdown plus indexed `.txt` companions, notes too short to index, genuinely
+unindexed notes, and non-text files — PDFs, docx, epub — which are classifiable
+only through a text sibling of the same basename. `.txt` companions themselves are
+never proposed as moves, or a PDF would be separated from its text.
+
+`plan --like <path>` answers the single-file question: nearest notes to that note's
+own vector, no query string, no scope.
+
+`--json` on `plan` is bounded: `--limit` (default 20) caps each array, `totals`
+stays exact and `truncated` says what was cut. On a 5,000-note vault the default is
+about 19 KB instead of 523 KB.
+
+### Calibration
+
+Two numbers come from the corpus, not from taste:
+
+- **vote gate** — the largest distance at which notes that *can* vote (two or more
+  legal neighbours) still keep modal agreement at or above 0.55. Coverage is
+  reported, not gated: a well-sorted vault has most notes already home, and a
+  coverage floor would refuse to calibrate a healthy corpus.
+- **duplicate floor** — from labelled `*-dup.md` pairs when they exist (p90 × 1.2,
+  capped at the measured 0.08 boundary), otherwise a gap in the within-folder
+  histogram.
+
+Both are stored in `.vaultindex.json` with the sweep table, sample size and date, so
+the choice is auditable rather than remembered. `plan` warns when the index has
+drifted more than `row_delta_trigger` rows since calibration and refuses outright
+when the model's dimensions changed.
+
+Calibration costs about 10 s at 600 samples over ~5 k notes, so it is never run by
+the watcher: `index`/`sync` bump a version in `.vaultindex/state.json`, the matrix
+cache validates against that version, and calibration runs only on `calibrate`, a
+model change, or a large row delta.
+
+### Apply and undo
+
+`apply` moves files with `git mv` when the file is tracked, rewrites path-qualified
+`[[dir/name]]` links and `![[...]]` embeds in one tree pass, refuses moves that would
+collide with an existing basename, and writes a manifest under
+`.vaultindex/applied/`. `undo` reverses one manifest, including the link rewrites.
+`plan` never mutates anything.
+
+### Tests
+
+```bash
+python tests/test_organize.py        # fixture vault, 22 acceptance checks
+```
+
+The fixture synthesises vectors so the correct destination is known by
+construction, and covers duplicates, movers, stubs, PDF companions, a basename
+collision, link rewriting, and a byte-identical apply→undo round trip.
 
 ## embed_vault.py — lightweight alternative
 

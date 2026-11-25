@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+#
+# vault — one entry point for indexing, searching and organizing a vault.
+#
+# Routes to the VaultIndex engine. The engine repo is found from this script's
+# own location (symlinks resolved), so a clone works anywhere; the venv and the
+# default vault are machine layout and are overridable:
+#
+#   VAULT_TOOLS     where the venv lives        (default: this machine's vault-tools)
+#   VAULTINDEX_HOME the engine repo             (default: this script's parent)
+#   VAULT_PATH      the vault to act on         (default: resolved from cwd)
+#   VAULT_DEFAULT   fallback when cwd has none  (default: knowledge-base)
+#
+#   vault kuramoto                          # bare words = search
+#   vault "deleuze fold" --top 3
+#   vault organize plan 00-inbox --json
+#   vault organize --like 13-concepts/Cybernetics.md
+#   vault sync --changed
+#   vault doctor
+#
+# A recognized subcommand passes through untouched. Otherwise the words before
+# the first flag are the query and everything from that flag on passes through:
+# `vault kuramoto --top 5` == `vault search kuramoto --top 5`.
+
+set -euo pipefail
+
+# Machine layout lives in a config file, never in the script: this repo is
+# public, and one person's volume names are not part of the tool.
+#   ~/.config/vault/config
+#     VAULT_TOOLS=/path/to/venv
+#     VAULT_DEFAULT=/path/to/vault
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/vault/config"
+if [ -f "$CONFIG" ]; then
+    # shellcheck disable=SC1090
+    . "$CONFIG"
+fi
+
+# ── locate the engine, following symlinks ──────────────────────────────────
+self_dir() {
+    src="${BASH_SOURCE[0]}"
+    while [ -L "$src" ]; do
+        dir="$(cd -P "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        case "$src" in
+            /*) ;;
+            *) src="$dir/$src" ;;
+        esac
+    done
+    cd -P "$(dirname "$src")" && pwd
+}
+SELF_DIR="$(self_dir)"
+
+if [ -n "${VAULTINDEX_HOME:-}" ]; then
+    VX="$VAULTINDEX_HOME"
+elif [ -f "$SELF_DIR/../organize.py" ]; then
+    VX="$(cd "$SELF_DIR/.." && pwd)"
+else
+    VX="$SELF_DIR"
+fi
+
+VT="${VAULT_TOOLS:-${XDG_DATA_HOME:-$HOME/.local/share}/vault-tools-venv}"
+PY="$VT/.venv/bin/python"
+# A venv passed directly is also accepted (bin/python rather than .venv/bin/python).
+[ -x "$PY" ] || PY="$VT/bin/python"
+DB="$VX/vault_db.py"
+
+if [ ! -x "$PY" ]; then
+    echo "vault: no python at $PY" >&2
+    echo "       set VAULT_TOOLS in $CONFIG, or the environment" >&2
+    exit 1
+fi
+if [ ! -f "$DB" ]; then
+    echo "vault: engine not found at $DB" >&2
+    echo "       a copy in ~/bin cannot see the repo; set VAULTINDEX_HOME" >&2
+    echo "       in $CONFIG, or in the environment" >&2
+    exit 1
+fi
+
+# ── resolve the vault: cwd upwards, then the configured default ────────────
+if [ -z "${VAULT_PATH:-}" ]; then
+    d="$PWD"
+    while [ "$d" != "/" ]; do
+        if [ -f "$d/.vaultindex.json" ] || [ -d "$d/.obsidian" ]; then
+            VAULT_PATH="$d"
+            break
+        fi
+        d="$(dirname "$d")"
+    done
+    if [ -z "${VAULT_PATH:-}" ]; then
+        VAULT_PATH="${VAULT_DEFAULT:-}"
+    fi
+    if [ -z "$VAULT_PATH" ]; then
+        echo "vault: no vault here and no default configured" >&2
+        echo "       run inside a vault, or set VAULT_PATH" >&2
+        echo "       (or VAULT_DEFAULT in $CONFIG)" >&2
+        exit 1
+    fi
+    export VAULT_PATH
+fi
+
+# ── instance data and taxonomy ─────────────────────────────────────────────
+if [ -z "${DB_DIR:-}" ]; then
+    DB_DIR="$("$PY" - "$VAULT_PATH" <<'PYCODE'
+import json, os, sys
+vault = sys.argv[1]
+try:
+    with open(os.path.join(vault, ".vaultindex.json")) as fh:
+        db = (json.load(fh) or {}).get("db")
+except Exception:
+    db = None
+print(db or os.path.join(vault, ".vaultindex", "lancedb"))
+PYCODE
+)"
+    export DB_DIR
+fi
+
+if [ -z "${DOMAINS_PATH:-}" ]; then
+    if [ -f "$VAULT_PATH/domains.json" ]; then
+        export DOMAINS_PATH="$VAULT_PATH/domains.json"
+    elif [ -n "${VAULT_DEFAULT:-}" ] && [ "$VAULT_PATH" = "$VAULT_DEFAULT" ] \
+         && [ -f "$VT/domains.json" ]; then
+        # A configured instance may carry its own taxonomy next to the venv.
+        # Any other vault must not inherit it: unset means built-in defaults.
+        export DOMAINS_PATH="$VT/domains.json"
+    fi
+fi
+
+# ── dispatch ───────────────────────────────────────────────────────────────
+KNOWN="index search stats doctor sync topics watch remove organize"
+
+if [ $# -eq 0 ]; then
+    exec "$PY" "$DB" --help
+fi
+
+case "$1" in
+    help|-h|--help) exec "$PY" "$DB" --help ;;
+esac
+
+for cmd in $KNOWN; do
+    if [ "$1" = "$cmd" ]; then
+        if [ "$cmd" = "organize" ]; then
+            shift
+            exec "$PY" "$VX/organize.py" "$@"
+        fi
+        exec "$PY" "$DB" "$@"
+    fi
+done
+
+# Bare words: the query is everything before the first flag; from that flag on,
+# arguments pass through untouched. `vault kuramoto --top 5` must search
+# "kuramoto" with --top 5, not the string "kuramoto 5".
+QUERY=()
+REST=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -*)
+            REST=("$@")
+            break
+            ;;
+        *)
+            QUERY+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# `${arr[@]+...}` guards against unbound-variable errors on macOS bash 3.2.
+if [ ${#QUERY[@]} -eq 0 ]; then
+    exec "$PY" "$DB" search ${REST[@]+"${REST[@]}"}
+fi
+
+exec "$PY" "$DB" search "${QUERY[*]}" ${REST[@]+"${REST[@]}"}
